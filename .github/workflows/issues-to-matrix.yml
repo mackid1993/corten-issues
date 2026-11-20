@@ -1,0 +1,476 @@
+name: Issues (private Matrix ID intake and room notices)
+
+# Outside reporters give their Matrix ID only as a reply comment after filing.
+# That comment is copied to a private issue tracker with a mirror of the issue, then
+# deleted here. No reply within 1 hour, or a Matrix ID posted anywhere else,
+# closes the issue. Accepted issue activity is announced in the Matrix room.
+#
+# Optional private triage data (secrets TRIAGE_DATA_KEY, TRIAGE_DATA_REPO):
+# issues from accounts listed there take the same steps here; their private
+# copy starts with the note kept alongside the list, and the room isn't told.
+#
+# Untrusted text is read only from the event JSON inside Python, never
+# interpolated into a shell command. Hosts and tokens come from secrets.
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  issue_comment:
+    types: [created, edited]
+  schedule:
+    # Off-peak minutes: GitHub delays or drops runs at busy times like :00.
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      deadline_minutes:
+        description: "Testing only: treat issues as expired after this many minutes (blank = 60)"
+        required: false
+        default: ""
+
+permissions:
+  issues: write
+
+# Deadline sweeps (timer and schedule) share one queue so two never close the
+# same issue at once. Issue and comment events queue per issue.
+concurrency:
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'deadline-sweep' || format('issue-{0}', github.event.issue.number) }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Handle issue activity
+        env:
+          MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
+          MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
+          MATRIX_BOT_TOKEN: ${{ secrets.MATRIX_BOT_TOKEN }}
+          INBOX_URL: ${{ secrets.INBOX_URL }}
+          INBOX_TOKEN: ${{ secrets.INBOX_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          DEADLINE_OVERRIDE: ${{ inputs.deadline_minutes }}
+          TRIAGE_DATA_KEY: ${{ secrets.TRIAGE_DATA_KEY }}
+          TRIAGE_DATA_REPO: ${{ secrets.TRIAGE_DATA_REPO }}
+        run: |
+          python3 - <<'PY'
+          import datetime, html, json, os, random, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+          EVENT = os.environ["GITHUB_EVENT_NAME"]
+          ev = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
+          repo = os.environ["GITHUB_REPOSITORY"]
+          API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          AWAIT, FAILED = "awaiting-matrix-id", "missing-matrix-id"
+          TEST_MARK = "<!-- matrix-id-gate-test -->"
+          DEADLINE = datetime.timedelta(hours=1)
+          _o = (os.environ.get("DEADLINE_OVERRIDE") or "").strip()
+          if EVENT == "workflow_dispatch" and _o.isdigit() and 0 < int(_o) <= 60:
+              DEADLINE = datetime.timedelta(minutes=int(_o))
+              print(f"Deadline override for this run: {_o} minutes")
+          MXID = re.compile(r"@[A-Za-z0-9._=/+\-]+:[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}(?::\d+)?")
+          e = html.escape
+
+          # Lenient parsing for the reporter's contact reply. People write Matrix IDs in many
+          # ways; accept them all and record a best guess for the maintainers.
+          HOST = r"[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}(?::\d+)?"
+          LOCAL = r"[A-Za-z0-9._=/+\-]+"
+          def contact_guesses(text):
+              t = text.strip()
+              found = []
+              def add(g):
+                  if g not in found:
+                      found.append(g)
+              for m in re.finditer(r"matrix\.to/#/(@" + LOCAL + ":" + HOST + ")", t):
+                  add(m.group(1))
+              for m in re.finditer(r"(?<![\w@])@?(" + LOCAL + "):(" + HOST + ")", t):
+                  add(f"@{m.group(1)}:{m.group(2)}")
+              for m in re.finditer(r"(?<![\w@])@?(" + LOCAL + ")@(" + HOST + ")", t):
+                  add(f"@{m.group(1)}:{m.group(2)} (written like an email)")
+              if not found:
+                  m = re.search(r"(?<![\w])@(" + LOCAL + r")$", t) or re.search(r"(?<![\w])@(" + LOCAL + r")\s", t)
+                  if m:
+                      add(f"@{m.group(1)} (no server given; probably @{m.group(1)}:beeper.com)")
+              if not found:
+                  words = re.findall(LOCAL, t)
+                  if len(t) <= 40 and len(words) == 1:
+                      add(f"{words[0]} (bare username; probably @{words[0]}:beeper.com)")
+              return found
+
+          def looks_like_contact(text):
+              t = (text or "").strip()
+              if not t:
+                  return False
+              if len(t) > 200:  # long comments count only with a clear Matrix ID
+                  return bool(MXID.search(t)) or "matrix.to/" in t
+              if contact_guesses(t):
+                  return True
+              return len(t) <= 80 and "\n" not in t
+
+          def http(method, url, token, data=None, scheme="Bearer", raw=False):
+              req = urllib.request.Request(url, method=method,
+                  data=json.dumps(data).encode() if data is not None else None,
+                  headers={"Authorization": f"{scheme} {token}",
+                           "Accept": "application/vnd.github+json" if url.startswith(API) else "application/json",
+                           "Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  body = r.read()
+                  return body.decode() if raw else json.loads(body or b"{}")
+
+          def gh(method, path, data=None, ok=()):
+              try:
+                  return http(method, f"{API}/repos/{repo}{path}", os.environ["GH_TOKEN"], data)
+              except urllib.error.HTTPError as err:
+                  if err.code in ok:
+                      return {}
+                  raise
+
+          def ensure_label(name, color, desc):
+              gh("POST", "/labels", {"name": name, "color": color, "description": desc}, ok=(422,))
+
+          def is_team(assoc):
+              return assoc in ("OWNER", "MEMBER", "COLLABORATOR")
+
+          def load_triage_data():
+              # (accounts, note) from the private triage repo. Accounts are logins or
+              # numeric user IDs, one per line; "#" starts a comment. Never logged.
+              import shutil, subprocess, tempfile
+              key, url = os.environ.get("TRIAGE_DATA_KEY") or "", os.environ.get("TRIAGE_DATA_REPO") or ""
+              if not key or not url:
+                  return set(), ""
+              d = tempfile.mkdtemp()
+              try:
+                  kf = os.path.join(d, "key")
+                  with open(os.open(kf, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+                      f.write(key.strip() + "\n")
+                  env = dict(os.environ, GIT_SSH_COMMAND=f"ssh -i {kf} -o IdentitiesOnly=yes "
+                             "-o StrictHostKeyChecking=accept-new -o BatchMode=yes")
+                  subprocess.run(["git", "clone", "-q", "--depth", "1", url, os.path.join(d, "data")],
+                                 env=env, check=True, timeout=60, capture_output=True)
+                  accounts = set()
+                  for line in open(os.path.join(d, "data", "accounts.txt")):
+                      accounts.update(w.lower() for w in line.split("#", 1)[0].split())
+                  note_path = os.path.join(d, "data", "note.md")
+                  note = open(note_path).read().strip() if os.path.exists(note_path) else ""
+                  return accounts, note
+              except Exception as err:
+                  print(f"Private triage data unavailable ({type(err).__name__})")
+                  return set(), ""
+              finally:
+                  shutil.rmtree(d, ignore_errors=True)
+
+          def listed(user, accounts):
+              user = user or {}
+              return user.get("login", "").lower() in accounts or str(user.get("id", "")) in accounts
+
+          _TRIAGE = []
+          def triage():
+              # Loaded once per run, only when a step needs it.
+              if not _TRIAGE:
+                  _TRIAGE.append(load_triage_data())
+              return _TRIAGE[0]
+
+          def quiet(issue):
+              # True for issues whose author is in the private triage data.
+              accounts, _ = triage()
+              return listed(issue.get("user"), accounts)
+
+          # ---------- messages ----------
+          INSTRUCTIONS = (
+              "👋 Thanks for filing this. **One more step, within 1 hour:**\n\n"
+              "Reply to this issue with a comment that contains **only your Matrix ID**, for example:\n\n"
+              "```\n@you:beeper.com\n```\n\n"
+              "Any format is fine (`you:beeper.com`, `you@beeper.com`, a matrix.to link). We'll work it out.\n\n"
+              "A bot deletes that comment within seconds and sends your Matrix ID privately to the "
+              "maintainers, so it doesn't stay on this page.\n\n"
+              "⚠️ **Don't put your Matrix ID anywhere else** (the title, the description, or any other "
+              "comment). If you do, it's public, and this issue will be closed.\n\n"
+              "If we don't get your Matrix ID within 1 hour, this issue is closed automatically."
+          )
+          ACCEPTED = ("✅ Got it. Your Matrix ID was removed from this page and sent privately to the "
+                      "maintainers. We'll contact you on Matrix.")
+          RETRY = ("⚠️ We removed your comment but couldn't record your Matrix ID. Please reply again "
+                   "with only your Matrix ID.")
+          TIMEOUT = ("⏰ Closed: no Matrix ID was received within 1 hour.\n\n"
+                     "We fix bugs by working with you directly on Matrix, so we can't help without a way "
+                     "to reach you. If you still need help, open a new issue and reply with your Matrix ID "
+                     "within 1 hour, as the template describes.")
+          def violation_msg(where):
+              return (f"🔒 Closed and locked: a Matrix ID was posted in {where} instead of as the reply "
+                      "the template asks for.\n\n"
+                      "We removed what we could, but it was public, and earlier versions may still be "
+                      "visible in this issue's edit history.\n\n"
+                      "To get help, open a new issue and follow the instructions exactly: reply with "
+                      "**only** your Matrix ID as a comment, within 1 hour.")
+          FOLLOW_UP = "Thank you for your submission. Someone will be in touch soon."
+          FOLLOW_UP_DELAY = int(os.environ.get("FOLLOW_UP_DELAY") or random.randint(60, 120))
+          OTHERS = ("A comment containing a Matrix ID was removed. Matrix IDs are only accepted from the "
+                    "person who opened the issue, as described in the issue template.")
+
+          # ---------- actions ----------
+          def contact_received(num):
+              # True once the bot has posted its "Got it" comment, i.e. the issue
+              # finished the Matrix ID step and was announced in the room.
+              for cm in gh("GET", f"/issues/{num}/comments?per_page=100") or []:
+                  if cm["user"]["login"] == "github-actions[bot]" and cm["body"].startswith("✅ Got it."):
+                      return True
+              return False
+
+          def close_issue(issue, comment, note):
+              num = issue["number"]
+              announced = contact_received(num)
+              # Another run (timer, sweep, event) may have closed it a moment ago.
+              fresh = gh("GET", f"/issues/{num}")
+              if fresh.get("state") == "closed":
+                  print(f"#{num}: already closed, skipping")
+                  return
+              labels_now = [l["name"] for l in issue.get("labels", [])]
+              ensure_label(FAILED, "b60205", "Closed: no Matrix ID received the right way")
+              gh("POST", f"/issues/{num}/comments", {"body": comment})
+              if AWAIT in labels_now:
+                  gh("DELETE", f"/issues/{num}/labels/{AWAIT}", ok=(404,))
+              gh("POST", f"/issues/{num}/labels", {"labels": [FAILED]})
+              gh("PATCH", f"/issues/{num}", {"state": "closed", "state_reason": "not_planned"})
+              gh("PUT", f"/issues/{num}/lock", {"lock_reason": "resolved"}, ok=(422,))
+              if announced:
+                  notify("autoclosed", issue, None, note=note)
+                  close_in_inbox(num, f"closed automatically ({note.lower()})")
+
+          def violation(issue, where):
+              num = issue["number"]
+              title = MXID.sub("[Matrix ID removed]", issue["title"])
+              body = MXID.sub("[Matrix ID removed]", issue.get("body") or "")
+              if title != issue["title"] or body != (issue.get("body") or ""):
+                  gh("PATCH", f"/issues/{num}", {"title": title, "body": body})
+              issue["title"] = title
+              close_issue(issue, violation_msg(where), "A Matrix ID was posted publicly")
+              print(f"#{num}: Matrix ID posted in {where}; closed and locked")
+
+          def inbox(method, suffix="", data=None):
+              return http(method, os.environ["INBOX_URL"] + suffix, os.environ["INBOX_TOKEN"],
+                          data, scheme="token")
+
+          def find_in_inbox(num, state):
+              # The private copy of GitHub issue #num, matched by its "GH #N:" title.
+              prefix = f"GH #{num}:"
+              for page in range(1, 21):
+                  batch = inbox("GET", f"?state={state}&type=issues&limit=50&page={page}") or []
+                  for it in batch:
+                      if it["title"].startswith(prefix):
+                          return it
+                  if len(batch) < 50:
+                      break
+              return None
+
+          def close_in_inbox(num, why):
+              # Close the private copy of GitHub issue #num, if it's still open.
+              it = find_in_inbox(num, "open")
+              if not it:
+                  print(f"#{num}: no open private copy")
+                  return
+              inbox("POST", f"/{it['number']}/comments", {"body": f"Closed on GitHub: {why}"})
+              inbox("PATCH", f"/{it['number']}", {"state": "closed"})
+              print(f"#{num}: private copy #{it['number']} closed")
+
+          def comment_to_inbox(num, comment):
+              # One-way copy of a GitHub comment into the private copy.
+              it = find_in_inbox(num, "all")
+              if not it:
+                  print(f"#{num}: no private copy for the comment")
+                  return
+              u = comment["user"]
+              text = (f"💬 **GitHub comment** by [@{u['login']}]({u['html_url']}) · "
+                      f"[view on GitHub]({comment['html_url']})\n\n"
+                      f"{comment.get('body') or '_(empty)_'}\n\n"
+                      "---\n_Copied from GitHub. Replies here stay private and are not posted to GitHub._")
+              inbox("POST", f"/{it['number']}/comments", {"body": text})
+              print(f"#{num}: comment copied to private copy #{it['number']}")
+
+          def mirror_to_inbox(issue, comment, note=""):
+              guesses = contact_guesses(comment["body"] or "")
+              dn = re.search(r"### If you're already in our Matrix room, what's your display name\?\s*\n+(.+?)\s*(?:\n### |\Z)",
+                             issue.get("body") or "", re.S)
+              dn = dn.group(1).strip() if dn else ""
+              if dn in ("", "_No response_"):
+                  dn = "not given"
+              lines = ([note, ""] if note else []) + [
+                  "**Matrix ID (best guess):** " + (", ".join("`" + g + "`" for g in guesses)
+                                                   if guesses else "not recognized, see the reply below"),
+                  f"**Display name in the room:** {dn}",
+                  f"**GitHub issue:** {issue['html_url']}",
+                  f"**Reporter:** [@{issue['user']['login']}]({issue['user']['html_url']})",
+                  f"**Opened:** {issue['created_at']}",
+                  f"**Labels:** {', '.join(l['name'] for l in issue.get('labels', []) if l['name'] != AWAIT) or 'none'}",
+                  "", "---", "", "## Original issue", "",
+                  (issue.get("body") or "_No description._").replace(TEST_MARK, ""),
+                  "", "## Contact reply (deleted from GitHub)", "", comment["body"],
+              ]
+              url = os.environ["INBOX_URL"]  # full private endpoint, kept in a secret
+              res = http("POST", url, os.environ["INBOX_TOKEN"],
+                         {"title": f"GH #{issue['number']}: {issue['title']}", "body": "\n".join(lines)},
+                         scheme="token")
+              return res.get("number")
+
+          # ---------- Matrix room notice ----------
+          def render(md):
+              try:
+                  return http("POST", f"{API}/markdown", os.environ["GH_TOKEN"],
+                              {"text": md, "mode": "gfm", "context": repo}, raw=True)
+              except Exception:
+                  return "<p>" + e(md).replace("\n", "<br>") + "</p>"
+
+          def excerpt(text, limit=700, max_lines=15):
+              text = (text or "").strip()
+              lines = text.splitlines()
+              if len(text) <= limit and len(lines) <= max_lines:
+                  return text, False
+              cut_text = "\n".join(lines[:max_lines])
+              if len(cut_text) > limit:
+                  cut = cut_text.rfind("\n", 0, limit)
+                  cut_text = cut_text[:cut if cut > limit // 2 else limit]
+              if cut_text.count("```") % 2:
+                  cut_text += "\n```"
+              return cut_text, True
+
+          SENT = [0]
+          def notify(kind, issue, actor, note=None, comment=None):
+              if quiet(issue):
+                  return
+              num, title, url = issue["number"], issue["title"], issue["html_url"]
+              link = f'<a href="{e(url)}"><b>#{num}: {e(title)}</b></a>'
+              shown = [l["name"] for l in issue.get("labels", []) if l["name"] not in (AWAIT, FAILED)]
+              label_html = " ".join(f"<code>{e(l)}</code>" for l in shown)
+              if kind == "new":
+                  u = issue["user"]
+                  who = f'<a href="{e(u["html_url"])}">@{e(u["login"])}</a>'
+                  formatted = f"🆕 <b>New issue</b> {link}<br>👤 {who}" + (f" · 🏷️ {label_html}" if shown else "")
+                  md, truncated = excerpt((issue.get("body") or "").replace(TEST_MARK, ""))
+                  if md:
+                      formatted += "<blockquote>" + render(md) + "</blockquote>"
+                  if truncated:
+                      formatted += f'<a href="{e(url)}">Read the full issue on GitHub →</a>'
+                  plain = f"🆕 New issue #{num}: {title}\nby @{u['login']}\n{url}"
+              elif kind == "autoclosed":
+                  formatted = f"🔒 <b>Closed automatically</b> {link}<br>ℹ️ {e(note)}"
+                  plain = f"🔒 Closed automatically #{num}: {title}\n{note}\n{url}"
+              elif kind == "comment":
+                  who = f'<a href="{e(actor["html_url"])}">@{e(actor["login"])}</a>'
+                  curl = comment["html_url"]
+                  formatted = f'💬 <b>New comment</b> on {link}<br>👤 {who}'
+                  md, truncated = excerpt(MXID.sub("[Matrix ID]", comment.get("body") or ""), limit=500, max_lines=10)
+                  if md:
+                      formatted += "<blockquote>" + render(md) + "</blockquote>"
+                  if truncated:
+                      formatted += f'<a href="{e(curl)}">Read the full comment on GitHub →</a>'
+                  plain = f"💬 New comment on #{num}: {title}\nby @{actor['login']}\n{curl}"
+              else:
+                  who = f'<a href="{e(actor["html_url"])}">@{e(actor["login"])}</a>'
+                  if kind == "closed":
+                      reason = issue.get("state_reason") or "completed"
+                      icon, word = {"completed": ("✅", "Closed as completed"),
+                                    "not_planned": ("🚫", "Closed as not planned"),
+                                    "duplicate": ("📑", "Closed as a duplicate")}.get(reason, ("✅", "Closed"))
+                  else:
+                      icon, word = "🔁", "Reopened"
+                  formatted = f"{icon} <b>{word}</b> {link}<br>👤 {who}"
+                  plain = f"{icon} {word} #{num}: {title}\nby @{actor['login']}\n{url}"
+              content = {"msgtype": "m.notice", "body": plain,
+                         "format": "org.matrix.custom.html", "formatted_body": formatted}
+              hs = os.environ["MATRIX_HOMESERVER"].rstrip("/")
+              room = urllib.parse.quote(os.environ["MATRIX_ROOM_ID"], safe="")
+              SENT[0] += 1
+              txn = f"gh-{os.environ['GITHUB_RUN_ID']}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}-{SENT[0]}"
+              http("PUT", f"{hs}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}",
+                   os.environ["MATRIX_BOT_TOKEN"], content)
+
+          # ---------- deadline sweep (timer and schedule runs only) ----------
+          def sweep():
+              now = datetime.datetime.now(datetime.timezone.utc)
+              for issue in gh("GET", f"/issues?state=open&labels={AWAIT}&per_page=100") or []:
+                  created = datetime.datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))
+                  if now - created >= DEADLINE:
+                      close_issue(issue, TIMEOUT, "No Matrix ID within 1 hour")
+                      print(f"#{issue['number']}: no Matrix ID within 1 hour; closed")
+
+          # ---------- dispatch ----------
+          if EVENT in ("schedule", "workflow_dispatch"):
+              sweep()
+              sys.exit(0)
+
+          issue = ev["issue"]
+          if "pull_request" in issue:  # this workflow is for issues only
+              sys.exit(0)
+          num = issue["number"]
+          labels = [l["name"] for l in issue.get("labels", [])]
+          body = issue.get("body") or ""
+          author_team = is_team(issue.get("author_association"))
+          action = ev["action"]
+
+          if EVENT == "issues":
+              if action == "opened":
+                  # Everyone, maintainers included, gives a Matrix ID the same way.
+                  if MXID.search(issue["title"]) or MXID.search(body):
+                      violation(issue, "the title or description")
+                  else:
+                      ensure_label(AWAIT, "fbca04", "Waiting for the reporter's Matrix ID")
+                      gh("POST", f"/issues/{num}/labels", {"labels": [AWAIT]})
+                      gh("POST", f"/issues/{num}/comments", {"body": INSTRUCTIONS})
+                      print(f"#{num}: asked for Matrix ID")
+              elif action == "edited":
+                  if ev["sender"]["login"] == issue["user"]["login"] \
+                          and (MXID.search(issue["title"]) or MXID.search(body)):
+                      violation(issue, "the title or description")
+              elif action == "reopened":
+                  if FAILED in labels and not author_team:
+                      close_issue(issue, TIMEOUT, "Reopened without a Matrix ID")
+                  elif contact_received(num):
+                      notify("reopened", issue, ev["sender"])
+              elif action == "closed":
+                  if contact_received(num):
+                      notify("closed", issue, ev["sender"])
+                      reason = (issue.get("state_reason") or "completed").replace("_", " ")
+                      close_in_inbox(num, f"closed as {reason} by @{ev['sender']['login']}")
+                  else:
+                      print(f"#{num}: closed before its Matrix ID was received; not announced")
+
+          elif EVENT == "issue_comment":
+              c = ev["comment"]
+              by_author = c["user"]["login"] == issue["user"]["login"]
+              # The issue author's comments are always handled. Maintainers commenting on
+              # someone else's issue may mention Matrix IDs freely.
+              commenter_team = is_team(c.get("author_association")) and not by_author
+              cbody = c["body"] or ""
+              if by_author and AWAIT in labels and issue["state"] == "open" and looks_like_contact(cbody):
+                  # The reporter's contact reply: accepted in any format.
+                  try:
+                      vnum = mirror_to_inbox(issue, c, triage()[1] if quiet(issue) else "")
+                  except Exception as err:
+                      gh("DELETE", f"/issues/comments/{c['id']}", ok=(404,))
+                      gh("POST", f"/issues/{num}/comments", {"body": RETRY})
+                      print(f"#{num}: private mirror failed: {type(err).__name__}")
+                      sys.exit(1)
+                  gh("DELETE", f"/issues/comments/{c['id']}", ok=(404,))
+                  gh("DELETE", f"/issues/{num}/labels/{AWAIT}", ok=(404,))
+                  gh("POST", f"/issues/{num}/comments", {"body": ACCEPTED})
+                  print(f"#{num}: contact reply accepted, mirrored privately as #{vnum}, comment deleted")
+                  issue["labels"] = [l for l in issue["labels"] if l["name"] != AWAIT]
+                  notify("new", issue, ev["sender"])
+                  # A short pause, then the same closing note on every accepted issue.
+                  time.sleep(FOLLOW_UP_DELAY)
+                  gh("POST", f"/issues/{num}/comments", {"body": FOLLOW_UP})
+              elif not commenter_team and MXID.search(cbody):
+                  # A full Matrix ID anywhere else is public, so remove it.
+                  gh("DELETE", f"/issues/comments/{c['id']}", ok=(404,))
+                  if by_author:
+                      violation(issue, "a comment")
+                  else:
+                      gh("POST", f"/issues/{num}/comments", {"body": OTHERS})
+                      print(f"#{num}: removed a Matrix ID posted by someone else")
+              elif ev["action"] == "created" and c["user"]["login"] != "github-actions[bot]":
+                  if contact_received(num):
+                      try:
+                          comment_to_inbox(num, c)
+                      except Exception as err:
+                          print(f"#{num}: copying the comment privately failed: {type(err).__name__}")
+                      notify("comment", issue, c["user"], comment=c)
+                  else:
+                      print(f"#{num}: comment before the Matrix ID was received; not announced")
+          PY
