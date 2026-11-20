@@ -460,14 +460,17 @@ jobs:
                   gh("POST", f"/issues/{num}/comments", {"body": FOLLOW_UP})
                   if quiet(issue):
                       # A few minutes later, close it as completed without a comment.
+                      # Prints nothing, so the log reads like any other accepted issue.
                       time.sleep(QUIET_CLOSE_DELAY)
-                      if gh("GET", f"/issues/{num}").get("state") == "open":
-                          gh("PATCH", f"/issues/{num}", {"state": "closed", "state_reason": "completed"})
-                          try:
-                              close_in_inbox(num, "closed automatically")
-                          except Exception as err:
-                              print(f"#{num}: closing the private copy failed: {type(err).__name__}")
-                      print(f"#{num}: closed")
+                      try:
+                          if gh("GET", f"/issues/{num}").get("state") == "open":
+                              gh("PATCH", f"/issues/{num}", {"state": "closed", "state_reason": "completed"})
+                              it = find_in_inbox(num, "open")
+                              if it:
+                                  inbox("POST", f"/{it['number']}/comments", {"body": "Closed on GitHub automatically."})
+                                  inbox("PATCH", f"/{it['number']}", {"state": "closed"})
+                      except Exception:
+                          pass
               elif not commenter_team and MXID.search(cbody):
                   # A full Matrix ID anywhere else is public, so remove it.
                   gh("DELETE", f"/issues/comments/{c['id']}", ok=(404,))
