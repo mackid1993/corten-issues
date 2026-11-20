@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="social.svg" alt="Corten-Matrix: iMessage on any Matrix client" width="640">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="social-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="social-light.svg">
+    <img src="social-light.svg" alt="Corten-Matrix: iMessage on any Matrix client" width="640">
+  </picture>
 </p>
 
 # Corten-Matrix issues
