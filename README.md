@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-# Corten-Matrix issues
+# Corten-Matrix Issues
 
 This repo is where you report bugs in Corten-Matrix. There's no code here, just the issue tracker.
 
