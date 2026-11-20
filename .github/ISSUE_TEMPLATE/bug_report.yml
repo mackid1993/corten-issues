@@ -41,7 +41,7 @@ body:
     id: version
     attributes:
       label: Bridge version
-      description: The release you're running, as listed on the download page at stilloxidizing.fyi.
+      description: The release you're running, as listed on the download page at corten-matrix.com.
       placeholder: "2.0.8"
     validations:
       required: true

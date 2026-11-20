@@ -10,7 +10,7 @@
 
 This repo is where you report bugs in Corten-Matrix. There's no code here, just the issue tracker.
 
-**Downloads, setup instructions and release notes:** https://stilloxidizing.fyi
+**Downloads, setup instructions and release notes:** https://corten-matrix.com
 
 Official builds come only from that site, signed and checksummed. If you're running a build from anywhere else, please reproduce the problem on an official build before filing.
 
