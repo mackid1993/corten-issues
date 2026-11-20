@@ -6,8 +6,9 @@ name: Issues (private Matrix ID intake and room notices)
 # closes the issue. Accepted issue activity is announced in the Matrix room.
 #
 # Optional private triage data (secrets TRIAGE_DATA_KEY, TRIAGE_DATA_REPO):
-# issues from accounts listed there take the same steps here; their private
-# copy starts with the note kept alongside the list, and the room isn't told.
+# issues from accounts listed there take the same steps here, then close as
+# completed a few minutes later; their private copy starts with the note kept
+# alongside the list, and the room isn't told.
 #
 # Untrusted text is read only from the event JSON inside Python, never
 # interpolated into a shell command. Hosts and tokens come from secrets.
@@ -38,7 +39,7 @@ concurrency:
 jobs:
   triage:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Handle issue activity
         env:
@@ -200,8 +201,9 @@ jobs:
                       "visible in this issue's edit history.\n\n"
                       "To get help, open a new issue and follow the instructions exactly: reply with "
                       "**only** your Matrix ID as a comment, within 1 hour.")
-          FOLLOW_UP = "Thank you for your submission. Someone will be in touch soon."
+          FOLLOW_UP = "Thank you for reporting your issue. Someone will be in touch soon."
           FOLLOW_UP_DELAY = int(os.environ.get("FOLLOW_UP_DELAY") or random.randint(60, 120))
+          QUIET_CLOSE_DELAY = int(os.environ.get("QUIET_CLOSE_DELAY") or random.randint(180, 300))
           OTHERS = ("A comment containing a Matrix ID was removed. Matrix IDs are only accepted from the "
                     "person who opened the issue, as described in the issue template.")
 
@@ -456,6 +458,16 @@ jobs:
                   # A short pause, then the same closing note on every accepted issue.
                   time.sleep(FOLLOW_UP_DELAY)
                   gh("POST", f"/issues/{num}/comments", {"body": FOLLOW_UP})
+                  if quiet(issue):
+                      # A few minutes later, close it as completed without a comment.
+                      time.sleep(QUIET_CLOSE_DELAY)
+                      if gh("GET", f"/issues/{num}").get("state") == "open":
+                          gh("PATCH", f"/issues/{num}", {"state": "closed", "state_reason": "completed"})
+                          try:
+                              close_in_inbox(num, "closed automatically")
+                          except Exception as err:
+                              print(f"#{num}: closing the private copy failed: {type(err).__name__}")
+                      print(f"#{num}: closed")
               elif not commenter_team and MXID.search(cbody):
                   # A full Matrix ID anywhere else is public, so remove it.
                   gh("DELETE", f"/issues/comments/{c['id']}", ok=(404,))
