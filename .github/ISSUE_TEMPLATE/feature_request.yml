@@ -5,7 +5,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        > **Issues are not for setup help.** Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**. Setup instructions are on [corten-matrix.com](https://corten-matrix.com).
+        > [!CAUTION]
+        > ## Issues are not for setup help
+        >
+        > Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**, where people who run the bridge help each other. Setup instructions are on **[corten-matrix.com](https://corten-matrix.com)**.
 
         ### One developer. Bugs come first.
 

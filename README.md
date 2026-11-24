@@ -10,7 +10,12 @@
 
 This repo is where you report bugs in Corten-Matrix. There's no code here, just the issue tracker.
 
-> **Issues are for bugs in the bridge, not setup help.** Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**, where people who run the bridge help each other. Issues asking for setup help are closed.
+> [!CAUTION]
+> ## Issues are for bridge bugs, not setup help
+>
+> Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**, where people who run the bridge help each other. Setup instructions are on **[corten-matrix.com](https://corten-matrix.com)**.
+>
+> **Issues asking for setup help are closed.**
 
 **Downloads, setup instructions and release notes:** https://corten-matrix.com
 
