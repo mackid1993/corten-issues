@@ -1,11 +1,27 @@
 name: Bug report
-description: Something in the bridge isn't working.
+description: Something in the bridge is broken. Not for setup help.
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        ### Please read before filing
+        > **Issues are for bugs in the bridge, not setup help.** Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**. Setup instructions are on [corten-matrix.com](https://corten-matrix.com). Issues asking for setup help are closed.
+
+        ### One developer. Bugs come first.
+
+        Corten-Matrix is built and maintained by one person, in their spare time.
+
+        1. **Serious bugs first:** messages lost or not delivering, the bridge failing to start or log in, anything that breaks it for many people.
+        2. **Minor bugs next:** cosmetic problems, rare edge cases, things with an easy workaround. Fixed when there's time.
+        3. **Feature requests last.**
+
+        ### Before you file
+
+        - **Update first.** Run `corten-matrix update` and check the problem still happens on the latest release.
+        - **Search the existing issues**, open and closed.
+        - **Is it really the bridge?** If the same thing fails in Apple's own Messages app, it's an Apple account problem, not a bridge bug.
+
+        ### What we may ask for
 
         Many bridge bugs only happen with a specific account, chat history or device setup. If we can't reproduce your problem on our own machines, we can't fix it. So we will usually message you on Matrix and may ask for:
 
@@ -25,8 +41,6 @@ body:
         - **No reply within 1 hour:** the issue is closed automatically.
         - **Matrix ID put anywhere else** (title, this form, any other comment): it's public, and the issue is closed and locked. If that happens, it's because the steps above weren't followed.
         - Your reply is visible on GitHub for a few seconds before the bot removes it, and may be included in email notifications to people watching this repository.
-
-        Problems with your Apple account itself (for example, it also fails in Apple's Messages app) usually aren't bridge bugs.
 
   - type: input
     id: room_display_name
@@ -121,6 +135,8 @@ body:
     attributes:
       label: Before you submit
       options:
+        - label: This is a bug in the bridge, not a setup question. Setup questions go in the community room.
+          required: true
         - label: This happens on the latest release.
           required: true
         - label: I understand you may contact me on Matrix and ask for my logs and bridge database, and that some bugs can't be fixed without them.

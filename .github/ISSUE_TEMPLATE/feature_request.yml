@@ -1,11 +1,15 @@
 name: Feature request
-description: Suggest something new for the bridge.
+description: Suggest something new for the bridge. Not for setup help.
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Bugs come first. Corten-Matrix has one developer, so feature requests may wait a long while, and some won't happen at all.
+        > **Issues are not for setup help.** Setup questions and "how do I...?" go in the **[community room](https://matrix.to/#/#corten-matrix:beeper.com)**. Setup instructions are on [corten-matrix.com](https://corten-matrix.com).
+
+        ### One developer. Bugs come first.
+
+        Corten-Matrix is built and maintained by one person, in their spare time. Serious bugs come first, then minor bugs, then feature requests. Feature requests are read, and good ones get built eventually, but never ahead of a bug. Some won't happen at all.
 
         ### How to give us your Matrix ID (required, and kept private only this way)
 
@@ -48,5 +52,9 @@ body:
     attributes:
       label: Before you submit
       options:
+        - label: This is a feature request, not a setup question. Setup questions go in the community room.
+          required: true
+        - label: I understand feature requests come after bugs and may wait a long while, or not happen at all.
+          required: true
         - label: I will reply with only my Matrix ID as a comment within 1 hour, and I won't put it anywhere else.
           required: true
